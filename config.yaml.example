@@ -1,0 +1,25 @@
+# Huntarr Minimal - Configuration
+# Copy this file to config.yaml and fill in your values.
+
+sonarr:
+  - name: "Main Sonarr"
+    url: "http://localhost:8989"
+    api_key: "your-sonarr-api-key"
+    hunt_missing: 5          # Max episodes/season-packs to search per cycle
+    hunt_upgrades: 0         # Max cutoff-unmet items to search per cycle (0 = disabled)
+    monitored_only: true     # Only process monitored series/episodes
+    skip_future: true        # Skip episodes that haven't aired yet
+
+radarr:
+  - name: "Main Radarr"
+    url: "http://localhost:7878"
+    api_key: "your-radarr-api-key"
+    hunt_missing: 5          # Max movies to search per cycle
+    hunt_upgrades: 0         # Max cutoff-unmet movies to search per cycle (0 = disabled)
+    monitored_only: true     # Only process monitored movies
+    skip_future: true        # Skip movies with future release dates
+
+# State tracking - prevents re-searching the same items every run
+state:
+  database: "./huntarr.db"   # Path to SQLite state file
+  ttl_hours: 168             # How long to remember searched items (168 = 7 days)
