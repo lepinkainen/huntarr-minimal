@@ -1,0 +1,10 @@
+services:
+  huntarr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: huntarr-minimal:latest
+    container_name: huntarr-minimal
+    restart: unless-stopped
+    volumes:
+      - ./data:/config
