@@ -1,6 +1,12 @@
 # Huntarr Minimal
 
-A single-file Python script (~400 lines) that searches for missing and quality-upgrade media in Sonarr and Radarr. No web UI, no database server, no framework dependencies.
+100% [vibe-engineered](https://simonwillison.net/2025/Oct/7/vibe-engineering/) from the original Huntarr project for my own needs, I ripped out all the non-essential features (for me) and left just the core functionality: searching for missing and upgrading items in Sonarr/Radarr, with a simple SQLite db to track state to avoid duplicate searches.
+
+It can be run either with a single Python file or as a Docker container with a mounted config directory. The container includes a cron scheduler, so it will run on the hour by default after the initial run.
+
+Even though this is fully vibed with Claude Opus 4.6 & [Pi](https://pi.dev)+GPT-5.3 Codex, I can pretty much guarantee there are no security issues like in the original project, there are no public APIs, no logins or web servers, thus the attack surface is effectively zero. It's just a script that runs and talks to your local Sonarr/Radarr instances.
+
+I also have zero intention of adding extra features to this beyond "search missing stuff and upgrade", it does what I need and nothing else. If you want a web UI or additional integrations, the Fork button is in the top right corner 😁 [Grugbrain dev](https://grugbrain.dev) says "complexity _very_, _very_ bad" and I agree.
 
 ## Requirements
 
@@ -53,17 +59,42 @@ Each run:
 
 The script runs once and exits. Schedule it with cron or a Docker cron container.
 
-## Docker (Unraid / future)
+## Docker / Compose
+
+The container now includes its own cron scheduler.
+
+Behavior on container start:
+
+1. Validates `/config/config.yaml` (fails fast if missing/invalid)
+2. Runs one immediate hunt pass
+3. Starts cron (`0 * * * *`) for hourly runs
+
+### Docker Compose (recommended)
+
+`compose.yml` maps `./data` on the host to `/config` in the container.
+
+```bash
+# 1. Prepare persistent config/data
+mkdir -p data
+cp config.yaml.example data/config.yaml
+# edit data/config.yaml
+
+# 2. Build and start
+docker compose up -d --build
+
+# 3. Follow logs
+docker compose logs -f
+```
+
+### Plain docker
 
 ```bash
 docker build -t huntarr-minimal .
-docker run --rm -v /mnt/user/appdata/huntarr-minimal:/config huntarr-minimal
-```
-
-For Unraid, mount `/config` to persistent storage. Add to cron via User Scripts plugin:
-
-```bash
-docker run --rm -v /mnt/user/appdata/huntarr-minimal:/config huntarr-minimal
+docker run -d \
+  --name huntarr-minimal \
+  --restart unless-stopped \
+  -v "$(pwd)/data:/config" \
+  huntarr-minimal
 ```
 
 ## Config Reference
