@@ -3,7 +3,7 @@ set -eu
 
 echo "[huntarr-minimal] Container starting..."
 echo "[huntarr-minimal] Validating /config/config.yaml..."
-python - <<'PY'
+python3 - <<'PY'
 from pathlib import Path
 import sys
 import yaml
@@ -49,10 +49,10 @@ print(f'[huntarr-minimal] Config validation passed ({len(instances)} instance(s)
 PY
 
 echo "[huntarr-minimal] Running initial huntarr pass..."
-python /app/huntarr.py -c /config/config.yaml
+python3 /app/huntarr.py -c /config/config.yaml
 echo "[huntarr-minimal] Initial huntarr pass completed successfully."
 
 echo "[huntarr-minimal] Cron schedule loaded from /etc/cron.d/huntarr"
-echo "[huntarr-minimal] Huntarr will run hourly at minute 0 using /config/config.yaml"
+echo "[huntarr-minimal] Huntarr will run according to cron settings /config/config.yaml"
 
 exec "$@"
