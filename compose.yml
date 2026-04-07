@@ -1,9 +1,6 @@
 services:
   huntarr:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: huntarr-minimal:latest
+    image: ghcr.io/lepinkainen/huntarr-minimal:latest
     container_name: huntarr-minimal
     restart: unless-stopped
     volumes:
