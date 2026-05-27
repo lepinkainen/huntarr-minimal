@@ -29,6 +29,15 @@ from pathlib import Path
 import requests
 import yaml
 
+# App keys used as the `app` column in the state DB. Treat as opaque identifiers —
+# changing a value silently splits the bucket and orphans prior history.
+APP_SONARR_MISSING = "sonarr"
+APP_SONARR_UPGRADE = "sonarr_upgrade"
+APP_RADARR_MISSING = "radarr"
+APP_RADARR_UPGRADE = "radarr_upgrade"
+
+_MIN_DT = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -71,42 +80,38 @@ class StateDB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS searched (
-                app       TEXT NOT NULL,
-                instance  TEXT NOT NULL,
-                media_id  TEXT NOT NULL,
-                searched_at TEXT NOT NULL,
+                app          TEXT NOT NULL,
+                instance     TEXT NOT NULL,
+                media_id     TEXT NOT NULL,
+                searched_at  TEXT NOT NULL,
+                search_count INTEGER DEFAULT 1,
                 PRIMARY KEY (app, instance, media_id)
             )
         """)
         self.conn.commit()
 
-    def is_searched(self, app: str, instance: str, media_id: str) -> bool:
-        cutoff = (
-            datetime.datetime.now(datetime.timezone.utc)
-            - datetime.timedelta(hours=self.ttl_hours)
-        ).isoformat()
-        row = self.conn.execute(
-            "SELECT 1 FROM searched WHERE app=? AND instance=? AND media_id=? AND searched_at>?",
-            (app, instance, media_id, cutoff),
-        ).fetchone()
-        return row is not None
+    def get_search_stats(self, app: str, instance: str, media_ids: list[str]) -> dict[str, tuple[int, str]]:
+        if not media_ids:
+            return {}
+        placeholders = ",".join("?" for _ in media_ids)
+        q = f"SELECT media_id, search_count, searched_at FROM searched WHERE app=? AND instance=? AND media_id IN ({placeholders})"
+        params = [app, instance] + media_ids
+        rows = self.conn.execute(q, params).fetchall()
+        return {row[0]: (row[1], row[2]) for row in rows}
+
+    def in_cooldown(self, last_searched: datetime.datetime, now: datetime.datetime) -> bool:
+        return (now - last_searched) < datetime.timedelta(hours=self.ttl_hours)
 
     def mark_searched(self, app: str, instance: str, media_id: str) -> None:
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.conn.execute(
-            "INSERT OR REPLACE INTO searched (app, instance, media_id, searched_at) VALUES (?,?,?,?)",
-            (app, instance, media_id, now),
-        )
+        self.conn.execute("""
+            INSERT INTO searched (app, instance, media_id, searched_at, search_count)
+            VALUES (?,?,?,?,1)
+            ON CONFLICT(app, instance, media_id) DO UPDATE SET
+                searched_at = excluded.searched_at,
+                search_count = searched.search_count + 1
+        """, (app, instance, media_id, now))
         self.conn.commit()
-
-    def purge_expired(self) -> int:
-        cutoff = (
-            datetime.datetime.now(datetime.timezone.utc)
-            - datetime.timedelta(hours=self.ttl_hours)
-        ).isoformat()
-        cur = self.conn.execute("DELETE FROM searched WHERE searched_at <= ?", (cutoff,))
-        self.conn.commit()
-        return cur.rowcount
 
     def close(self) -> None:
         self.conn.close()
@@ -167,6 +172,38 @@ def _parse_date(s: str | None) -> datetime.datetime | None:
         return None
 
 
+def _select_candidates(
+    state: StateDB,
+    app: str,
+    instance: str,
+    items: list[dict],
+    limit: int,
+) -> list[tuple[dict, int, datetime.datetime | None]]:
+    """Drop items still in cooldown; return up to `limit` items ordered by
+    fewest prior searches first (then oldest last-searched), so never-found
+    releases drift to the top instead of blocking fresh candidates."""
+    if not items:
+        return []
+    item_ids = [str(it["id"]) for it in items]
+    stats = state.get_search_stats(app, instance, item_ids)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    candidates: list[tuple[dict, int, datetime.datetime | None]] = []
+    for it in items:
+        iid = str(it["id"])
+        if iid not in stats:
+            candidates.append((it, 0, None))
+            continue
+        count, searched_at_str = stats[iid]
+        last_searched = _parse_date(searched_at_str)
+        if last_searched and state.in_cooldown(last_searched, now):
+            continue
+        candidates.append((it, count, last_searched))
+
+    candidates.sort(key=lambda x: (x[1], x[2] or _MIN_DT))
+    return candidates[:limit]
+
+
 def sonarr_hunt_missing(
     client: ArrClient,
     instance: str,
@@ -179,7 +216,6 @@ def sonarr_hunt_missing(
     """Find missing episodes in Sonarr via wanted/missing and trigger searches."""
     log.info("  [%s] Hunting missing episodes (limit=%d)", instance, limit)
 
-    # Get total count first
     data = client.get("wanted/missing", params={
         "page": 1, "pageSize": 1, "includeSeries": "true", "monitored": monitored_only,
     })
@@ -188,7 +224,6 @@ def sonarr_hunt_missing(
         log.info("  [%s] No missing episodes found", instance)
         return 0
 
-    # Fetch a random page of reasonable size
     page_size = min(100, total)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = random.randint(1, total_pages)
@@ -199,36 +234,26 @@ def sonarr_hunt_missing(
     })
     episodes = data.get("records", [])
 
-    # Filter monitored
     if monitored_only:
         episodes = [
             ep for ep in episodes
             if ep.get("series", {}).get("monitored", False) and ep.get("monitored", False)
         ]
 
-    # Skip future episodes
-    now = datetime.datetime.now(datetime.timezone.utc)
     if skip_future:
+        now = datetime.datetime.now(datetime.timezone.utc)
         episodes = [
             ep for ep in episodes
             if not (d := _parse_date(ep.get("airDateUtc"))) or d <= now
         ]
 
-    # Filter already-searched
-    candidates = [
-        ep for ep in episodes
-        if not state.is_searched("sonarr", instance, str(ep["id"]))
-    ]
-
-    if not candidates:
-        log.info("  [%s] All sampled episodes already searched recently", instance)
+    to_search = _select_candidates(state, APP_SONARR_MISSING, instance, episodes, limit)
+    if not to_search:
+        log.info("  [%s] All sampled episodes are in their cooling-off period", instance)
         return 0
 
-    # Pick random subset up to limit
-    to_search = random.sample(candidates, min(limit, len(candidates)))
-
     searched = 0
-    for ep in to_search:
+    for ep, count, _last_searched in to_search:
         ep_id = ep["id"]
         series_title = ep.get("series", {}).get("title", "?")
         season = ep.get("seasonNumber", "?")
@@ -236,12 +261,12 @@ def sonarr_hunt_missing(
         label = f"{series_title} S{season:02d}E{episode_num:02d}" if isinstance(season, int) and isinstance(episode_num, int) else f"{series_title} S{season}E{episode_num}"
 
         if dry_run:
-            log.info("  [%s] [DRY RUN] Would search: %s (id=%s)", instance, label, ep_id)
+            log.info("  [%s] [DRY RUN] Would search: %s (id=%s, count=%d)", instance, label, ep_id, count)
         else:
             try:
                 client.post("command", {"name": "EpisodeSearch", "episodeIds": [ep_id]})
-                log.info("  [%s] Triggered search: %s", instance, label)
-                state.mark_searched("sonarr", instance, str(ep_id))
+                log.info("  [%s] Triggered search: %s (count=%d)", instance, label, count)
+                state.mark_searched(APP_SONARR_MISSING, instance, str(ep_id))
                 searched += 1
             except Exception as e:
                 log.error("  [%s] Search failed for %s: %s", instance, label, e)
@@ -260,7 +285,6 @@ def sonarr_hunt_upgrades(
     """Find cutoff-unmet episodes in Sonarr and trigger searches."""
     log.info("  [%s] Hunting quality upgrades (limit=%d)", instance, limit)
 
-    # Get total count
     data = client.get("wanted/cutoff", params={
         "page": 1, "pageSize": 1, "includeSeries": "true", "monitored": monitored_only,
     })
@@ -269,7 +293,6 @@ def sonarr_hunt_upgrades(
         log.info("  [%s] No cutoff-unmet episodes found", instance)
         return 0
 
-    # Random page
     page_size = min(100, total)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = random.randint(1, total_pages)
@@ -286,19 +309,13 @@ def sonarr_hunt_upgrades(
             if ep.get("series", {}).get("monitored", False) and ep.get("monitored", False)
         ]
 
-    candidates = [
-        ep for ep in episodes
-        if not state.is_searched("sonarr_upgrade", instance, str(ep["id"]))
-    ]
-
-    if not candidates:
-        log.info("  [%s] All sampled cutoff episodes already searched recently", instance)
+    to_search = _select_candidates(state, APP_SONARR_UPGRADE, instance, episodes, limit)
+    if not to_search:
+        log.info("  [%s] All sampled cutoff episodes are in their cooling-off period", instance)
         return 0
 
-    to_search = random.sample(candidates, min(limit, len(candidates)))
-
     searched = 0
-    for ep in to_search:
+    for ep, count, _last_searched in to_search:
         ep_id = ep["id"]
         series_title = ep.get("series", {}).get("title", "?")
         season = ep.get("seasonNumber", "?")
@@ -306,12 +323,12 @@ def sonarr_hunt_upgrades(
         label = f"{series_title} S{season:02d}E{episode_num:02d}" if isinstance(season, int) and isinstance(episode_num, int) else f"{series_title} S{season}E{episode_num}"
 
         if dry_run:
-            log.info("  [%s] [DRY RUN] Would upgrade-search: %s (id=%s)", instance, label, ep_id)
+            log.info("  [%s] [DRY RUN] Would upgrade-search: %s (id=%s, count=%d)", instance, label, ep_id, count)
         else:
             try:
                 client.post("command", {"name": "EpisodeSearch", "episodeIds": [ep_id]})
-                log.info("  [%s] Triggered upgrade search: %s", instance, label)
-                state.mark_searched("sonarr_upgrade", instance, str(ep_id))
+                log.info("  [%s] Triggered upgrade search: %s (count=%d)", instance, label, count)
+                state.mark_searched(APP_SONARR_UPGRADE, instance, str(ep_id))
                 searched += 1
             except Exception as e:
                 log.error("  [%s] Upgrade search failed for %s: %s", instance, label, e)
@@ -334,7 +351,6 @@ def radarr_hunt_missing(
     """Find missing movies in Radarr via wanted/missing and trigger searches."""
     log.info("  [%s] Hunting missing movies (limit=%d)", instance, limit)
 
-    # Get total via minimal query
     data = client.get("wanted/missing", params={
         "page": 1, "pageSize": 1, "monitored": monitored_only,
     })
@@ -343,7 +359,6 @@ def radarr_hunt_missing(
         log.info("  [%s] No missing movies found", instance)
         return 0
 
-    # Random page
     page_size = min(100, total)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = random.randint(1, total_pages)
@@ -357,9 +372,8 @@ def radarr_hunt_missing(
     if monitored_only:
         movies = [m for m in movies if m.get("monitored", False)]
 
-    # Skip future releases
-    now = datetime.datetime.now(datetime.timezone.utc)
     if skip_future:
+        now = datetime.datetime.now(datetime.timezone.utc)
         filtered = []
         for m in movies:
             rd = _parse_date(m.get("releaseDate") or m.get("digitalRelease") or m.get("physicalRelease"))
@@ -368,32 +382,25 @@ def radarr_hunt_missing(
             filtered.append(m)
         movies = filtered
 
-    # Filter already-searched
-    candidates = [
-        m for m in movies
-        if not state.is_searched("radarr", instance, str(m["id"]))
-    ]
-
-    if not candidates:
-        log.info("  [%s] All sampled movies already searched recently", instance)
+    to_search = _select_candidates(state, APP_RADARR_MISSING, instance, movies, limit)
+    if not to_search:
+        log.info("  [%s] All sampled movies are in their cooling-off period", instance)
         return 0
 
-    to_search = random.sample(candidates, min(limit, len(candidates)))
-
     searched = 0
-    for movie in to_search:
+    for movie, count, _last_searched in to_search:
         mid = movie["id"]
         title = movie.get("title", "?")
         year = movie.get("year", "?")
         label = f"{title} ({year})"
 
         if dry_run:
-            log.info("  [%s] [DRY RUN] Would search: %s (id=%s)", instance, label, mid)
+            log.info("  [%s] [DRY RUN] Would search: %s (id=%s, count=%d)", instance, label, mid, count)
         else:
             try:
                 client.post("command", {"name": "MoviesSearch", "movieIds": [mid]})
-                log.info("  [%s] Triggered search: %s", instance, label)
-                state.mark_searched("radarr", instance, str(mid))
+                log.info("  [%s] Triggered search: %s (count=%d)", instance, label, count)
+                state.mark_searched(APP_RADARR_MISSING, instance, str(mid))
                 searched += 1
             except Exception as e:
                 log.error("  [%s] Search failed for %s: %s", instance, label, e)
@@ -433,31 +440,25 @@ def radarr_hunt_upgrades(
     if monitored_only:
         movies = [m for m in movies if m.get("monitored", False)]
 
-    candidates = [
-        m for m in movies
-        if not state.is_searched("radarr_upgrade", instance, str(m["id"]))
-    ]
-
-    if not candidates:
-        log.info("  [%s] All sampled cutoff movies already searched recently", instance)
+    to_search = _select_candidates(state, APP_RADARR_UPGRADE, instance, movies, limit)
+    if not to_search:
+        log.info("  [%s] All sampled cutoff movies are in their cooling-off period", instance)
         return 0
 
-    to_search = random.sample(candidates, min(limit, len(candidates)))
-
     searched = 0
-    for movie in to_search:
+    for movie, count, _last_searched in to_search:
         mid = movie["id"]
         title = movie.get("title", "?")
         year = movie.get("year", "?")
         label = f"{title} ({year})"
 
         if dry_run:
-            log.info("  [%s] [DRY RUN] Would upgrade-search: %s (id=%s)", instance, label, mid)
+            log.info("  [%s] [DRY RUN] Would upgrade-search: %s (id=%s, count=%d)", instance, label, mid, count)
         else:
             try:
                 client.post("command", {"name": "MoviesSearch", "movieIds": [mid]})
-                log.info("  [%s] Triggered upgrade search: %s", instance, label)
-                state.mark_searched("radarr_upgrade", instance, str(mid))
+                log.info("  [%s] Triggered upgrade search: %s (count=%d)", instance, label, count)
+                state.mark_searched(APP_RADARR_UPGRADE, instance, str(mid))
                 searched += 1
             except Exception as e:
                 log.error("  [%s] Upgrade search failed for %s: %s", instance, label, e)
@@ -475,11 +476,6 @@ def run(cfg: dict, dry_run: bool = False) -> dict:
     ttl = state_cfg.get("ttl_hours", 168)
 
     state = StateDB(db_path, ttl_hours=ttl)
-
-    # Purge expired entries
-    purged = state.purge_expired()
-    if purged:
-        log.info("Purged %d expired state entries (older than %dh)", purged, ttl)
 
     totals = {"sonarr_missing": 0, "sonarr_upgrades": 0, "radarr_missing": 0, "radarr_upgrades": 0}
 
