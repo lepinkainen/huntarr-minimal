@@ -1,2 +1,4 @@
 config.yaml
-huntarr.db
+huntarr.db*
+__pycache__/
+.antigravitycli/
